@@ -1,0 +1,14 @@
+# Build artifacts
+build/
+compile_commands.json
+
+# Local tooling
+.cache/
+.clangd/
+.idea/
+.vs/
+
+# OS metadata
+.DS_Store
+Desktop.ini
+Thumbs.db
