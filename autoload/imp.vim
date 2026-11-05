@@ -6,8 +6,9 @@ let g:imp_autoload_loaded = v:true
 let s:enabled = v:false
 let s:queue = []
 let s:current = {}
-let s:last_applied_mode = ""
-let s:last_requested_mode = ""
+let s:last_mode = ""
+let s:last_pair = ""
+let s:last_config = ""
 
 function! s:append_output(value) abort
   if empty(s:current)
@@ -33,6 +34,18 @@ function! s:backend_path() abort
   let l:root = fnamemodify(resolve(expand("<script>:p")), ":h:h")
   let l:name = (has("win32") || has("win64")) ? "imp.exe" : "imp"
   return l:root . "/bin/" . l:name
+endfunction
+
+function! s:config() abort
+  let l:path = get(g:, "imp_config", "")
+  if type(l:path) != v:t_string
+    throw "[imp] g:imp_config must be a string"
+  endif
+  return empty(l:path) ? "" : fnamemodify(expand(l:path), ":p")
+endfunction
+
+function! s:config_args(config) abort
+  return empty(a:config) ? [] : ["--config", a:config]
 endfunction
 
 function! s:drain() abort
@@ -101,6 +114,18 @@ function! s:nvim_stdout(job, data, event) abort
   endif
 endfunction
 
+function! s:pair() abort
+  let l:pair = get(g:, "imp_pair", "")
+  if type(l:pair) != v:t_string
+    throw "[imp] g:imp_pair must be a string"
+  endif
+  return l:pair
+endfunction
+
+function! s:pair_args(pair) abort
+  return empty(a:pair) ? [] : ["--pair", a:pair]
+endfunction
+
 function! s:start(item) abort
   let l:command = [s:backend_path()] + a:item.args
 
@@ -148,14 +173,52 @@ function! s:status_done(item, ok, output, exit_code) abort
   endif
 endfunction
 
-function! s:sync_done(item, ok, output, exit_code) abort
-  if a:ok
-    let s:last_applied_mode = a:item.mode
-    let s:last_requested_mode = ""
+function! s:scheduled_mode(pair, config) abort
+  " The last pending set determines the final mode, even across status requests.
+  for l:item in reverse(copy(s:queue))
+    if l:item.label ==# "sync"
+      return l:item.pair ==# a:pair && l:item.config ==# a:config ? l:item.mode : ""
+    endif
+  endfor
+
+  if get(s:current, "label", "") ==# "sync"
+    return s:current.pair ==# a:pair && s:current.config ==# a:config ? s:current.mode : ""
+  endif
+  return s:last_pair ==# a:pair && s:last_config ==# a:config ? s:last_mode : ""
+endfunction
+
+function! s:sync(force) abort
+  if !s:enabled
     return
   endif
 
-  let s:last_requested_mode = ""
+  let l:mode = s:target_mode()
+  let l:pair = s:pair()
+  let l:config = s:config()
+  if !a:force && l:mode ==# s:scheduled_mode(l:pair, l:config)
+    return
+  endif
+
+  call add(s:queue, {
+        \ "mode": l:mode,
+        \ "pair": l:pair,
+        \ "config": l:config,
+        \ "args": s:config_args(l:config) + s:pair_args(l:pair) + ["set", l:mode],
+        \ "callback": function("s:sync_done"),
+        \ "label": "sync",
+        \ "output": [],
+        \ })
+  call s:drain()
+endfunction
+
+function! s:sync_done(item, ok, output, exit_code) abort
+  if a:ok
+    let s:last_mode = a:item.mode
+    let s:last_pair = a:item.pair
+    let s:last_config = a:item.config
+    return
+  endif
+
   echoerr "[imp] " . join(a:output, " | ")
 endfunction
 
@@ -198,8 +261,9 @@ endfunction
 function! imp#disable() abort
   let s:enabled = v:false
   let s:queue = []
-  let s:last_applied_mode = ""
-  let s:last_requested_mode = ""
+  let s:last_mode = ""
+  let s:last_pair = ""
+  let s:last_config = ""
 
   if !empty(s:current)
     if has("nvim")
@@ -214,44 +278,23 @@ endfunction
 
 function! imp#enable() abort
   let s:enabled = v:true
-  let s:last_applied_mode = ""
-  let s:last_requested_mode = ""
-
-  call imp#sync()
+  call imp#resync()
 endfunction
 
 function! imp#resync() abort
-  let s:last_applied_mode = ""
-  let s:last_requested_mode = ""
-
-  call imp#sync()
+  let s:last_mode = ""
+  let s:last_pair = ""
+  let s:last_config = ""
+  call s:sync(v:true)
 endfunction
 
 function! imp#status() abort
-  call s:enqueue(["status"], function("s:status_done"), "status")
+  call s:enqueue(s:config_args(s:config()) + s:pair_args(s:pair()) + ["status"],
+        \ function("s:status_done"), "status")
 endfunction
 
 function! imp#sync() abort
-  if !s:enabled
-    return
-  endif
-
-  let l:mode = s:target_mode()
-  if l:mode ==# s:last_applied_mode || l:mode ==# s:last_requested_mode
-    return
-  endif
-
-  let s:last_requested_mode = l:mode
-  let l:item = {
-        \ "mode": l:mode,
-        \ "args": ["set", l:mode],
-        \ "callback": function("s:sync_done"),
-        \ "label": "sync",
-        \ "output": [],
-        \ }
-
-  call add(s:queue, l:item)
-  call s:drain()
+  call s:sync(v:false)
 endfunction
 
 function! imp#toggle() abort

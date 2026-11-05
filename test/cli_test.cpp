@@ -25,11 +25,18 @@ enum class Scenario
   ForeignSetError,
   NativeSetError,
   InformationalSuccess,
+  PairUnsupported,
+  ConfigFailure,
+  ConfigUnsupported,
 };
 
 Scenario scenario{Scenario::Success};
 int query_calls{0};
 int set_calls{0};
+int pair_calls{0};
+std::string selected_pair;
+int config_calls{0};
+std::string selected_config;
 
 const x_error_domain native_domain{nullptr, nullptr, nullptr, "test-native"};
 const x_error_domain informational_domain{
@@ -42,6 +49,35 @@ const x_error_domain informational_domain{
 class TestBackend final : public imp::Backend
 {
 public:
+  x_error load_config(const std::string& path) override
+  {
+    ++config_calls;
+    selected_config = path;
+    if (scenario == Scenario::ConfigUnsupported) {
+      return Backend::load_config(path);
+    }
+    if (scenario == Scenario::ConfigFailure) {
+      return x_error("posix", EINVAL, "bad.conf:2: malformed record");
+    }
+    return x_ok();
+  }
+
+  x_error configure_pair(const std::string& name) override
+  {
+    if (config_calls != 1) {
+      return x_error("posix", EINVAL, "pair must be selected after loading configuration");
+    }
+    ++pair_calls;
+    if (scenario == Scenario::PairUnsupported) {
+      return Backend::configure_pair(name);
+    }
+    if (name != "wetype" && name != "pinyin" && name != "wubi") {
+      return x_error("posix", EINVAL, "unknown pair");
+    }
+    selected_pair = name;
+    return x_ok();
+  }
+
   imp::Status status() const override
   {
     ++query_calls;
@@ -110,6 +146,10 @@ Result run(std::initializer_list<const char*> arguments, Scenario selected = Sce
   scenario = selected;
   query_calls = 0;
   set_calls = 0;
+  pair_calls = 0;
+  selected_pair.clear();
+  config_calls = 0;
+  selected_config.clear();
 
   std::vector<std::string> storage{"imp"};
   for (const char* argument : arguments) {
@@ -170,6 +210,36 @@ int main()
   const std::string status_output =
     "backend=test-backend\nmode=native\nsource_id=test.native\nsource_name=Test Native\n";
   expect("status", run({"status"}), EXIT_SUCCESS, status_output, "");
+  check(pair_calls == 0, "unspecified pair uses backend default");
+  check(config_calls == 1 && selected_config.empty(), "CLI requests automatic config discovery");
+  expect("explicit config", run({"--config", "path with spaces.conf", "status"}), EXIT_SUCCESS, status_output, "");
+  check(selected_config == "path with spaces.conf" && pair_calls == 0, "explicit file keeps its own default pair");
+  expect("config and pair", run({"set", "native", "--pair", "pinyin", "--config", "custom.conf"}),
+    EXIT_SUCCESS, "mode=native\n", "");
+  check(selected_config == "custom.conf" && selected_pair == "pinyin", "explicit pair overrides file default");
+  expect("bad config", run({"--config", "bad.conf", "--pair", "pinyin", "set", "native"}, Scenario::ConfigFailure),
+    EXIT_FAILURE, "", diagnostic("posix", EINVAL, "bad.conf:2: malformed record"));
+  check(pair_calls == 0 && query_calls == 0 && set_calls == 0, "invalid config must not select a pair or run an operation");
+  expect("unsupported config", run({"--config", "custom.conf", "status"}, Scenario::ConfigUnsupported), EXIT_FAILURE, "",
+    diagnostic("posix", ENOTSUP, "Input-source configuration is not supported by this backend"));
+  check(query_calls == 0 && set_calls == 0, "unsupported config is not ignored");
+  for (const char* pair : {"wetype", "pinyin", "wubi"}) {
+    expect("named pair status", run({"--pair", pair, "status"}), EXIT_SUCCESS, status_output, "");
+    check(pair_calls == 1 && selected_pair == pair && query_calls == 1,
+      "configure selected pair before querying");
+    expect("named pair set", run({"--pair", pair, "set", "native"}), EXIT_SUCCESS, "mode=native\n", "");
+    check(pair_calls == 1 && selected_pair == pair && set_calls == 1 && query_calls == 0,
+      "configure selected pair without querying before setting");
+    expect("named pair alphanumeric", run({"set", "alphanumeric", "--pair", pair}),
+      EXIT_SUCCESS, "mode=alphanumeric\n", "");
+    check(selected_pair == pair, "pair option may follow the command");
+  }
+  expect("unknown pair", run({"--pair", "missing", "set", "native"}), EXIT_FAILURE, "",
+    diagnostic("posix", EINVAL, "unknown pair"));
+  check(pair_calls == 1 && query_calls == 0 && set_calls == 0, "invalid pair must not run an operation");
+  expect("unsupported pair", run({"--pair", "pinyin", "status"}, Scenario::PairUnsupported), EXIT_FAILURE, "",
+    diagnostic("posix", ENOTSUP, "Input-source pair selection is not supported by this backend"));
+  check(query_calls == 0 && set_calls == 0, "unsupported pair must not be ignored");
   expect("unknown mode", run({"status"}, Scenario::UnknownMode), EXIT_SUCCESS,
     "backend=test-backend\nmode=unknown\n", "");
   expect("query failure", run({"status"}, Scenario::QueryFailure), EXIT_FAILURE, "",
@@ -204,12 +274,37 @@ int main()
 
   const Result help = run({"--help"});
   check(help.exit_code == EXIT_SUCCESS && help.error.empty(), "help succeeds");
-  check(help.output.find("Usage: imp <command>\n") == 0, "help usage");
+  check(help.output.find("Usage: imp [--config <path>] [--pair <name>] <command>\n") == 0, "help usage");
   expect("short help", run({"-h"}), EXIT_SUCCESS, help.output, "");
   const Result version = run({"--version"});
   check(version.exit_code == EXIT_SUCCESS && version.error.empty(), "version succeeds");
   check(version.output.find("imp ") == 0, "version output");
   expect("short version", run({"-v"}), EXIT_SUCCESS, version.output, "");
+  expect("help does not configure pair", run({"--pair", "pinyin", "--help"}), EXIT_SUCCESS, help.output, "");
+  check(pair_calls == 0 && query_calls == 0 && set_calls == 0, "help does not invoke backend operations");
+  expect("help does not load config", run({"--config", "missing.conf", "--help"}), EXIT_SUCCESS, help.output, "");
+  check(config_calls == 0, "help bypasses configuration loading");
+  expect("missing config path", run({"--config"}), EXIT_FAILURE, help.output,
+    diagnostic("posix", EINVAL, "--config requires a path"));
+  expect("empty config path", run({"--config", "", "status"}), EXIT_FAILURE, help.output,
+    diagnostic("posix", EINVAL, "--config requires a path"));
+  expect("option instead of config path", run({"--config", "--help"}), EXIT_FAILURE, help.output,
+    diagnostic("posix", EINVAL, "--config requires a path"));
+  expect("duplicate config", run({"--config", "a.conf", "--config", "b.conf", "status"}), EXIT_FAILURE, help.output,
+    diagnostic("posix", EINVAL, "--config must be specified only once"));
+  check(config_calls == 0, "config syntax failures must not invoke the backend");
+
+  expect("missing pair name", run({"--pair"}), EXIT_FAILURE, help.output,
+    diagnostic("posix", EINVAL, "--pair requires a name"));
+  expect("empty pair name", run({"--pair", "", "status"}), EXIT_FAILURE, help.output,
+    diagnostic("posix", EINVAL, "--pair requires a name"));
+  expect("option instead of pair name", run({"--pair", "--help"}), EXIT_FAILURE, help.output,
+    diagnostic("posix", EINVAL, "--pair requires a name"));
+  expect("duplicate pair", run({"--pair", "pinyin", "--pair", "wubi", "status"}), EXIT_FAILURE, help.output,
+    diagnostic("posix", EINVAL, "--pair must be specified only once"));
+  expect("pair without command", run({"--pair", "pinyin"}), EXIT_FAILURE, help.output,
+    diagnostic("posix", EINVAL, "expected a command"));
+  check(pair_calls == 0 && query_calls == 0 && set_calls == 0, "pair parsing failures do not invoke backend operations");
 
   expect("missing command", run({}), EXIT_FAILURE, help.output,
     diagnostic("posix", EINVAL, "expected a command"));

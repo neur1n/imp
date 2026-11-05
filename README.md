@@ -32,7 +32,8 @@
 
 Supported platforms and input sources:
 - Linux: WIP.
-- macOS: WeType (微信输入法) and ABC.
+- macOS: Pinyin - Simplified, Wubi - Simplified, or WeType (微信输入法), paired
+  with ABC.
 - Windows: WIP.
 
 See [Platform Support](#platform-support) for details.
@@ -49,7 +50,8 @@ See [Platform Support](#platform-support) for details.
 ### Operating system
 - Linux: WIP
 - macOS: Xcode Command Line Tools or an equivalent Objective-C++ toolchain and
-  macOS SDK; WeType and ABC installed and enabled.
+  macOS SDK; ABC and the native source for your selected pair installed and
+  enabled.
 - Windows: WIP.
 
 ## Installation
@@ -63,7 +65,8 @@ cmake --build build
 cmake --install build --prefix "$PWD"
 ```
 
-This installs `bin/imp`.
+This installs `bin/imp` and, if it does not already exist, `bin/imp.conf`.
+Reinstalling does not overwrite an existing configuration.
 
 ### Manual Editor Integration
 Add the repository to your `runtimepath`:
@@ -143,6 +146,66 @@ Or in Lua:
 vim.g.imp_backend = "/absolute/path/to/imp/build/imp"
 ```
 
+On macOS, select an input-source pair with `g:imp_pair`:
+
+```vim
+let g:imp_pair = 'pinyin'
+```
+
+Or in Lua:
+
+```lua
+vim.g.imp_pair = "pinyin"
+```
+
+Pair names come from the configuration file; the preset includes `wetype`,
+`pinyin`, and `wubi`. Leaving `g:imp_pair` unset or empty uses the first pair.
+The plugin passes the selected pair to both `status` and `set` commands.
+
+### Pair File
+On macOS, imp reads `imp.conf` beside the executable, not in the current working
+directory. The repository's [`bin/imp.conf`](bin/imp.conf) contains:
+
+```text
+# name alphanumeric_source_id native_source_id
+wetype com.apple.keylayout.ABC com.tencent.inputmethod.wetype.pinyin
+pinyin com.apple.keylayout.ABC com.apple.inputmethod.SCIM.ITABC
+wubi com.apple.keylayout.ABC com.apple.inputmethod.SCIM.WBX
+```
+
+The first record is the default. Add, remove, reorder, or edit pairs without
+rebuilding. A file replaces the built-in list; it is not merged with it.
+Records must have exactly three whitespace-separated fields and unique,
+case-sensitive names. Empty lines and full-line `#` comments are ignored;
+inline comments, quotes, and escapes are not supported. Use source IDs rather
+than display names. To find an ID, select the source in macOS and run `imp status`.
+
+Use an explicit file, for example one outside the plugin directory that will
+not be affected by plugin updates:
+
+```vim
+let g:imp_config = '/absolute/path/to/imp.conf'
+```
+
+```lua
+vim.g.imp_config = "/absolute/path/to/imp.conf"
+```
+
+Unset or empty `g:imp_config` uses automatic discovery. When using `build/imp`
+for development, automatic discovery looks in `build/`, not `bin/`; set
+`g:imp_config` to the repository's `bin/imp.conf` if desired.
+
+Each CLI invocation rereads the file. If no automatic file exists, imp uses
+the built-in pairs with `wetype` first. An explicit file must exist; unreadable,
+empty, malformed, and duplicate-name configurations produce errors rather
+than falling back. Other platforms do not support explicit pair configuration.
+
+After editing a file while the plugin is enabled, call `imp#resync()` to reread
+and apply it; file changes are not watched. Changing `g:imp_pair` or
+`g:imp_config` is noticed on the next synchronization. Already queued requests
+retain their pair name and config path, but read the file's contents when
+their CLI process starts.
+
 ## CLI
 Use the executable directly, or add its directory to `PATH`:
 
@@ -154,32 +217,63 @@ imp --help
 imp --version
 ```
 
+Choose a macOS pair with `--pair <name>`, before or after the command:
+
+```sh
+imp --pair pinyin status
+imp --pair pinyin set native
+imp --pair pinyin set alphanumeric
+imp --pair wubi set native
+```
+
+The choice applies only to that invocation; pass the same pair on each call.
+Without `--pair`, macOS uses the first pair in its loaded configuration.
+Override the automatically discovered file with `--config <path>`:
+
+```sh
+imp --config /absolute/path/to/imp.conf status
+imp --config /absolute/path/to/imp.conf --pair pinyin set native
+```
+
+Both options may appear before or after the command. Relative `--config` paths
+are resolved against the CLI's working directory; executable-relative discovery
+resolves symlinks to the actual executable. `--help` and `--version` do not load
+configuration.
+
 `status` prints `key=value` lines: `backend`, `mode`, and, when available,
 `source_id` and `source_name`. `set` prints the requested mode, such as
 `mode=native`, on success. `mode=unknown` means the current state could not be
-mapped; it is not itself an error.
+mapped to the selected pair; it is not itself an error.
 
 Success exits with `0`; failures exit with `EXIT_FAILURE` and print `error:
 [domain:code] message` to `stderr`, without a success result on `stdout`.
 
 ## Platform Support
 ### macOS
-The `macos-tis` backend switches between registered input-source pairs using
-TIS. The built-in pair is:
+The `macos-tis` backend switches between configured input-source pairs using
+TIS. All preset pairs use ABC (`com.apple.keylayout.ABC`) for `alphanumeric`:
 
-| Input state | Input source | Source ID |
+| Pair | Native input source | Native source ID |
 | --- | --- | --- |
-| `native` | WeType (微信输入法) | `com.tencent.inputmethod.wetype.pinyin` |
-| `alphanumeric` | ABC | `com.apple.keylayout.ABC` |
+| `wetype` (default) | WeType (微信输入法) | `com.tencent.inputmethod.wetype.pinyin` |
+| `pinyin` | Pinyin - Simplified | `com.apple.inputmethod.SCIM.ITABC` |
+| `wubi` | Wubi - Simplified | `com.apple.inputmethod.SCIM.WBX` |
 
 This changes the selected source, not the input method's internal conversion
 mode; selecting WeType does not guarantee Chinese mode. No keyboard events are
 simulated.
 
-The backend uses the pair containing the current source, falling back to the
-first pair if none matches. An unavailable target source causes an error. Add
-pairs in [`src/platform/macos_backend.mm`](src/platform/macos_backend.mm) and
-rebuild; runtime configuration is not supported.
+The selected pair determines both target sources and status interpretation,
+regardless of the current source. A source outside that pair reports
+`mode=unknown`. Unknown pair names cause errors; there is no fallback to another
+pair. The file may include sources that are not installed or enabled; loading
+and querying do not require them to be available.
+
+Only the target of a `set` command must be installed, enabled, and selectable.
+Errors distinguish sources not found among installed sources, disabled sources,
+and sources that cannot be selected, and include the target source ID. A missing
+native source does not prevent switching to an available alphanumeric source.
+imp never automatically installs or enables sources.
 
 ### Linux / Windows
 WIP: Linux IBus/Fcitx5 and Windows target-thread TSF queries and mode control

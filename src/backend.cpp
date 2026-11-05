@@ -6,6 +6,19 @@
 
 namespace imp
 {
+x_error Backend::load_config(const std::string& path)
+{
+  if (path.empty()) {
+    return x_ok();
+  }
+  return x_error("posix", ENOTSUP, "Input-source configuration is not supported by this backend");
+}
+
+x_error Backend::configure_pair(const std::string&)
+{
+  return x_error("posix", ENOTSUP, "Input-source pair selection is not supported by this backend");
+}
+
 const char* mode_name(const Mode mode)
 {
   switch (mode) {

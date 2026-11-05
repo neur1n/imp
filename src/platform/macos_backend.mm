@@ -1,23 +1,18 @@
 #include "imp/backend.h"
 #include "detail/macos_error.h"
+#include "detail/macos_source.h"
 
 #include <Carbon/Carbon.h>
+#include <mach-o/dyld.h>
+
+#include <filesystem>
+#include <utility>
 
 
 namespace imp
 {
 namespace
 {
-struct InputSourcePair
-{
-  const char* alphanumeric;
-  const char* native;
-};
-
-constexpr InputSourcePair k_supported[]{
-  {"com.apple.keylayout.ABC", "com.tencent.inputmethod.wetype.pinyin"},
-};
-
 std::string copy_cf_string(CFTypeRef value)
 {
   if (value == nullptr || CFGetTypeID(value) != CFStringGetTypeID()) {
@@ -37,67 +32,63 @@ std::string copy_cf_string(CFTypeRef value)
   return res;
 }
 
-std::string current_source_id()
+x_error default_config_path(std::string& path)
 {
-  TISInputSourceRef src{TISCopyCurrentKeyboardInputSource()};
-  if (src == nullptr) {
-    return {};
-  }
-
-  const std::string id = copy_cf_string(
-      TISGetInputSourceProperty(src, kTISPropertyInputSourceID));
-
-  CFRelease(src);
-
-  return id;
-}
-
-const InputSourcePair* find_pair(const std::string& source_id)
-{
-  for (const InputSourcePair& pair : k_supported) {
-    if (source_id == pair.alphanumeric || source_id == pair.native) {
-      return &pair;
+  uint32_t size = 1024;
+  std::vector<char> buffer(size);
+  if (_NSGetExecutablePath(buffer.data(), &size) != 0) {
+    buffer.resize(size);
+    if (_NSGetExecutablePath(buffer.data(), &size) != 0) {
+      return x_error("posix", EIO, "Could not locate the executable for configuration discovery");
     }
   }
-
-  return nullptr;
-}
-
-const char* mode_to_source(const InputSourcePair& pair, const Mode mode)
-{
-  switch (mode) {
-    case Mode::Native:
-      return pair.native;
-    case Mode::Alphanumeric:
-      return pair.alphanumeric;
-    case Mode::Unknown:
-      return nullptr;
+  std::error_code error;
+  const auto executable = std::filesystem::canonical(buffer.data(), error);
+  if (error) {
+    return x_error("posix", error.value(), "Could not resolve the executable for configuration discovery");
   }
-
-  return nullptr;
+  path = (executable.parent_path() / "imp.conf").string();
+  return x_ok();
 }
 
 x_error select_source(const char* source_id)
 {
-  x_error err;
-
-  CFArrayRef sources = TISCreateInputSourceList(nullptr, false);
-  if (sources == nullptr) {
-    return err.set("posix", EIO, "macOS did not return available input sources");
+  const CFStringRef id = CFStringCreateWithCString(nullptr, source_id, kCFStringEncodingUTF8);
+  if (id == nullptr) {
+    return x_error("posix", EINVAL, "Input source ID is not valid UTF-8");
+  }
+  const void* keys[]{kTISPropertyInputSourceID};
+  const void* values[]{id};
+  CFDictionaryRef filter = CFDictionaryCreate(nullptr, keys, values, 1,
+    &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+  CFRelease(id);
+  if (filter == nullptr) {
+    return x_error("posix", ENOMEM, "Could not create an input-source filter");
   }
 
-  err.set("posix", ENOENT, "The requested input source was not found");
+  // Query enabled sources first; enumerate installed sources only for this target.
+  CFArrayRef sources = TISCreateInputSourceList(filter, false);
+  if (sources != nullptr && CFArrayGetCount(sources) == 0) {
+    CFRelease(sources);
+    sources = TISCreateInputSourceList(filter, true);
+  }
+  CFRelease(filter);
+  if (sources == nullptr) {
+    return x_error("posix", EIO, "macOS did not return available input sources");
+  }
 
-  const CFIndex cnt = CFArrayGetCount(sources);
-  for (CFIndex idx = 0; idx < cnt; ++idx) {
+  x_error err;
+  if (CFArrayGetCount(sources) == 0) {
+    const std::string message = std::string("Input source was not found among installed sources: ") + source_id;
+    err.set("posix", ENOENT, message.c_str());
+  } else {
     TISInputSourceRef src = static_cast<TISInputSourceRef>(
-        const_cast<void*>(CFArrayGetValueAtIndex(sources, idx)));
-    const std::string current = copy_cf_string(
-       TISGetInputSourceProperty(src, kTISPropertyInputSourceID));
-
-    if (current == source_id) {
+        const_cast<void*>(CFArrayGetValueAtIndex(sources, 0)));
+    err = detail::source_availability(source_id,
+      TISGetInputSourceProperty(src, kTISPropertyInputSourceIsEnabled) == kCFBooleanTrue,
+      TISGetInputSourceProperty(src, kTISPropertyInputSourceIsSelectCapable) == kCFBooleanTrue);
+    if (!err) {
       err.set(detail::osstatus_domain, TISSelectInputSource(src));
-      break;
     }
   }
 
@@ -106,35 +97,49 @@ x_error select_source(const char* source_id)
   return err;
 }
 
-Mode source_to_mode(const std::string& source_id)
-{
-  const InputSourcePair* pair = find_pair(source_id);
-  if (pair == nullptr) {
-    return Mode::Unknown;
-  }
-
-  if (source_id == pair->native) {
-    return Mode::Native;
-  }
-
-  return Mode::Alphanumeric;
-}
-
 class MacOSBackend final : public Backend
 {
 public:
+  x_error load_config(const std::string& path) override
+  {
+    std::string resolved = path;
+    if (resolved.empty()) {
+      const x_error error = default_config_path(resolved);
+      if (error) {
+        return error;
+      }
+    }
+    std::vector<InputSourcePair> pairs;
+    const x_error error = load_pairs(resolved, pairs);
+    if (error) {
+      if (!path.empty() || error.value() != ENOENT) {
+        return error;
+      }
+      pairs = detail::k_supported;
+    }
+    this->m_pairs = std::move(pairs);
+    this->m_pair = &this->m_pairs.front();
+    return x_ok();
+  }
+
+  x_error configure_pair(const std::string& name) override
+  {
+    const auto* pair = find_pair(this->m_pairs, name);
+    if (pair == nullptr) {
+      const std::string message = "Unknown macOS input-source pair: " + name;
+      return x_error("posix", EINVAL, message.c_str());
+    }
+    this->m_pair = pair;
+    return x_ok();
+  }
+
   x_error set_mode(const Mode mode) override
   {
     if (mode != Mode::Native && mode != Mode::Alphanumeric) {
       return x_error("posix", EINVAL, "mode must be 'native' or 'alphanumeric'");
     }
 
-    const InputSourcePair* pair = find_pair(current_source_id());
-    if (pair == nullptr) {
-      pair = &k_supported[0];
-    }
-
-    const char* source_id = mode_to_source(*pair, mode);
+    const char* source_id = detail::mode_to_source(*this->m_pair, mode);
     return select_source(source_id);
   }
 
@@ -159,11 +164,15 @@ public:
     if (res.source_id.empty()) {
       res.error.set("posix", EIO, "macOS did not return a valid input source ID");
     } else {
-      res.mode = source_to_mode(res.source_id);
+      res.mode = detail::source_to_mode(*this->m_pair, res.source_id);
     }
 
     return res;
   }
+
+private:
+  std::vector<InputSourcePair> m_pairs{detail::k_supported};
+  const InputSourcePair* m_pair{&this->m_pairs.front()};
 };  // class MacOSBackend
 }  // namespace
 

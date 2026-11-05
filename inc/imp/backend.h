@@ -67,6 +67,19 @@ public:
   /// @brief Destroy the backend and release its resources.
   virtual ~Backend() = default;
 
+  /// @brief Configure the named input-source pair used by subsequent operations.
+  /// @param name Pair name from the loaded configuration or built-in pairs.
+  /// @return An error for an unknown pair or POSIX ENOTSUP if pair selection is unsupported.
+  /// @note Does not switch the input source. A failed configuration preserves the previous pair.
+  virtual x_error configure_pair(const std::string& name);
+
+  /// @brief Load input-source pairs without querying or switching sources.
+  /// @param path Configuration file; empty selects automatic discovery.
+  /// @return An error for invalid/unreadable configuration or unsupported explicit configuration.
+  /// @note On macOS, an absent automatic imp.conf uses built-in pairs; an explicit path must exist.
+  ///       Loading selects the first pair. Failure preserves the previous configuration.
+  virtual x_error load_config(const std::string& path);
+
   /// @brief Request a target input state using the backend's control mechanism.
   /// @param mode Requested @ref Mode::Native or @ref Mode::Alphanumeric state.
   /// @return An error value whose domain determines success or failure.
